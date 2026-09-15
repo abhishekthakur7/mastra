@@ -565,7 +565,7 @@ describe('T04 replacement recovery campaign', () => {
     expect((await campaign.ledger.snapshot()).reservations[0]).toMatchObject({ status: 'running', sessionIdHash: expectedSessionIdHash });
   });
 
-  it('finalizes a first version-probe failure before spawning a provider process', async () => {
+  it('rejects a first version-probe failure before creating a recovery reservation', async () => {
     authorize();
     const options = await createRecoveryDryOptions('mastra-recovery-version-prestart-');
     const initialMetadataProbe = options.metadataProbe!;
@@ -587,7 +587,43 @@ describe('T04 replacement recovery campaign', () => {
     await expect(runClaudeT04RecoveryCampaign(preStartOptions, campaign)).rejects.toMatchObject({ code: 'profile-not-ready' });
     expect(metadataCalls).toBe(1);
     expect(spawnCalls).toBe(0);
-    expect((await campaign.ledger.snapshot()).reservations[0]).toMatchObject({ status: 'failed', outcome: 'failed_before_start', failureCode: 'profile-not-ready' });
+    expect((await campaign.ledger.snapshot()).reservations).toHaveLength(0);
+  });
+
+  it('rejects failed authentication before creating a recovery reservation', async () => {
+    authorize();
+    const options = await createRecoveryDryOptions('mastra-recovery-auth-prestart-');
+    const initialMetadataProbe = options.metadataProbe!;
+    let metadataCalls = 0;
+    let spawnCalls = 0;
+    const preStartOptions: ClaudeLiveProbeOptions = {
+      ...options,
+      metadataProbe: async input => {
+        metadataCalls += 1;
+        if (input.command === 'auth-status') {
+          return {
+            command: input.command,
+            ok: false,
+            exitCode: 1,
+            timedOut: false,
+            aborted: false,
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            authEvidence: { loggedIn: false, authMethod: 'subscription', apiProvider: 'firstParty', exitCode: 1, blocked: false },
+          };
+        }
+        return initialMetadataProbe(input);
+      },
+      protocolProcessRunner: (scope, command) => {
+        spawnCalls += 1;
+        return options.protocolProcessRunner!(scope, command);
+      },
+    };
+    const campaign = await prepareClaudeT04RecoveryCampaign(workspace!);
+    await expect(runClaudeT04RecoveryCampaign(preStartOptions, campaign)).rejects.toMatchObject({ code: 'profile-not-ready' });
+    expect(metadataCalls).toBe(2);
+    expect(spawnCalls).toBe(0);
+    expect((await campaign.ledger.snapshot()).reservations).toHaveLength(0);
   });
 
   it('keeps a genuine pre-dispatch failure classified as failed before start', async () => {

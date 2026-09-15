@@ -779,11 +779,7 @@ async function runClaudeT04RecoveryTurn(
   let executable: ClaudeExecutableEvidence;
   let claudeVersion: string;
   try {
-    executable = await captureClaudeExecutableEvidence(options.executableEvidence.executable);
-    if (!sameRecoveryExecutableIdentity(executable, options.executableEvidence)) {
-      throw new ClaudeT04RecoveryError('executable-invalid', 'recovery executable identity changed before reservation start');
-    }
-    claudeVersion = await observeClaudeLiveVersion(options);
+    ({ executable, claudeVersion } = await observeRecoveryAdmission(options));
   } catch (error) {
     const failure = error instanceof ClaudeT04RecoveryError
       ? error
@@ -890,6 +886,32 @@ function recoveryExecutableIdentity(value: ClaudeExecutableEvidence): import('./
 
 function sameRecoveryExecutableIdentity(left: ClaudeExecutableEvidence, right: ClaudeExecutableEvidence): boolean {
   return left.kind === right.kind && left.executable === right.executable && left.realpath === right.realpath && left.uid === right.uid && left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+
+type RecoveryAdmission = Readonly<{
+  readonly executable: ClaudeExecutableEvidence;
+  readonly claudeVersion: string;
+}>;
+
+/**
+ * Perform the no-reservation recovery admission check. This is intentionally
+ * kept separate from the per-turn revalidation so the campaign cannot create
+ * a ledger reservation before executable/version/auth evidence is ready.
+ */
+async function observeRecoveryAdmission(options: ClaudeLiveProbeOptions): Promise<RecoveryAdmission> {
+  assertLiveProbeOptIn();
+  assertLiveOptions(options);
+  try {
+    const executable = await captureClaudeExecutableEvidence(options.executableEvidence.executable);
+    if (!sameRecoveryExecutableIdentity(executable, options.executableEvidence)) {
+      throw new ClaudeT04RecoveryError('executable-invalid', 'recovery executable identity changed before reservation start');
+    }
+    const claudeVersion = await observeClaudeLiveVersion(options);
+    return { executable, claudeVersion };
+  } catch (error) {
+    if (error instanceof ClaudeT04RecoveryError || error instanceof ClaudeLiveProbeError) throw error;
+    throw new ClaudeT04RecoveryError('executable-invalid', 'recovery executable/version evidence could not be observed');
+  }
 }
 
 const LIVE_PLAN_CONTEXT = Symbol('claude-live-plan-context');
@@ -1312,6 +1334,11 @@ export async function runClaudeT04RecoveryCampaign(
   campaign: ClaudeT04RecoveryCampaign,
 ): Promise<readonly ClaudeT04RecoveryTurnResult[]> {
   assertPreparedClaudeT04RecoveryCampaign(campaign);
+  assertRecoveryOptIn();
+  // Admission is deliberately before reservation: a missing, malformed, or
+  // unauthenticated executable/version must not create recovery ledger state.
+  // Each turn repeats this check immediately before its own provider boundary.
+  await observeRecoveryAdmission(options);
   const reservations = await reserveClaudeT04RecoveryCampaign(campaign);
   const structured = await runClaudeT04RecoveryTurn(options, campaign, reservations[0]);
   if (structured.result.status !== 'completed' || structured.result.outcome !== 'completed') return [structured];

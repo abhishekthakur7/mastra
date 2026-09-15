@@ -9,6 +9,8 @@ Use literal model names/IDs from `docs/src/plugins/remark-model-tokens/models.ts
 
 Use the narrowest package build/test/lint/typecheck; run unit/integration before E2E. Prefer targeted `pnpm --filter` or `pnpm turbo build --filter` commands; avoid root setup/build scripts unless needed. Fresh clone: `pnpm install`, then build relevant dependencies. Unresolved workspace imports usually mean dependencies need building; some integration tests need `pnpm i --ignore-workspace`.
 
+For ticket work, freeze scope and acceptance before editing; fix demonstrated blockers and record speculative concerns as follow-ups. After one focused remediation, reassess against acceptance instead of stacking fixes. Keep narrow tests green, commit and push accepted slices promptly, and pause/report if scope or the diff grows materially.
+
 Features/new packages need docs. For docs, follow `docs/AGENTS.md` and styleguides. After code changes, read `@.mastracode/commands/changeset.md`.
 
 Architecture: `packages/core/src`; `mastra/` config/DI; `agent/`, `tools/`, `memory/`, `workflows/`, `storage/` are modular framework components.

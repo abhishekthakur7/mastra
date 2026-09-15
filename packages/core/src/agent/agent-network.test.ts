@@ -4454,6 +4454,82 @@ describe('Agent - network - tool approval and suspension', () => {
       expect(toolResult?.result).toContain('my additional info');
     });
 
+    it('should preserve run identity and request context while resuming a direct network tool', async () => {
+      const seenRequestContexts: unknown[] = [];
+      const contextAwareSuspendingTool = createTool({
+        id: 'contextAwareSuspendingTool',
+        description: 'A tool that suspends once while retaining request context.',
+        inputSchema: z.object({ initialQuery: z.string() }),
+        suspendSchema: z.object({ message: z.string() }),
+        resumeSchema: z.object({ userResponse: z.string() }),
+        execute: async (input, context: any) => {
+          seenRequestContexts.push(context.requestContext);
+          if (!context.agent?.resumeData) {
+            return await context.agent.suspend({ message: 'Please provide context-aware input' });
+          }
+          return { result: `Received: ${input.initialQuery} and ${context.agent.resumeData.userResponse}` };
+        },
+      });
+
+      const requestContext = new RequestContext();
+      requestContext.set('tenantId', 'resume-network-tenant');
+      const mockModel = createRoutingMockModel(
+        'contextAwareSuspendingTool',
+        'tool',
+        JSON.stringify({ initialQuery: 'context continuity' }),
+      );
+      const networkAgent = new Agent({
+        id: 'resume-context-network-agent',
+        name: 'Resume Context Network Agent',
+        instructions: 'Use the context-aware suspending tool when asked to collect information.',
+        model: mockModel,
+        tools: { contextAwareSuspendingTool },
+        memory,
+      });
+      const mastra = new Mastra({
+        agents: { networkAgent },
+        storage,
+        logger: false,
+      });
+      const registeredAgent = mastra.getAgent('networkAgent');
+
+      const initialStream = await registeredAgent.network('Collect context continuity information', {
+        memory: {
+          thread: 'test-thread-suspend-context',
+          resource: 'test-resource-suspend-context',
+        },
+        requestContext,
+      });
+      const initialChunks: any[] = [];
+      for await (const chunk of initialStream) {
+        initialChunks.push(chunk);
+      }
+
+      expect(initialChunks[initialChunks.length - 1].type).toBe('tool-execution-suspended');
+
+      const resumedStream = await registeredAgent.resumeNetwork(
+        { userResponse: 'context-aware resume data' },
+        {
+          runId: initialStream.runId,
+          memory: {
+            thread: 'test-thread-suspend-context',
+            resource: 'test-resource-suspend-context',
+          },
+          requestContext,
+        },
+      );
+      const resumedChunks: any[] = [];
+      for await (const chunk of resumedStream) {
+        resumedChunks.push(chunk);
+      }
+
+      expect(resumedStream.runId).toBe(initialStream.runId);
+      expect(resumedChunks[resumedChunks.length - 1].type).toBe('network-execution-event-finish');
+      expect(seenRequestContexts).toHaveLength(2);
+      expect(seenRequestContexts).toEqual([requestContext, requestContext]);
+      expect((seenRequestContexts[1] as RequestContext).get('tenantId')).toBe('resume-network-tenant');
+    });
+
     it('should resume suspended nested agent tool', async () => {
       const routingMockModel = createRoutingMockModel(
         'subAgent',

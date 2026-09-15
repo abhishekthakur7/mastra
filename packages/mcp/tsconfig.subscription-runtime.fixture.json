@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "noUnusedLocals": true
+  },
+  "include": ["src/__fixtures__/subscription-runtime/**/*.ts"],
+  "exclude": ["node_modules"]
+}

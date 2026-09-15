@@ -17,6 +17,7 @@ import {
   createBodyLimitTestSuite,
 } from '@internal/server-adapter-test-utils';
 import { Mastra } from '@mastra/core';
+import { Agent } from '@mastra/core/agent';
 import { registerApiRoute } from '@mastra/core/server';
 import {
   TraceQueryExecutionError,
@@ -1589,6 +1590,116 @@ describe('Hono Server Adapter', () => {
         expect(response.status).toBe(200);
         const data = await response.json();
         expect(data.isStudio).toBeNull();
+      }
+    });
+  });
+
+  describe('network request context forwarding', () => {
+    const trustedContext = {
+      mastra__resourceId: 'trusted-resource',
+      mastra__threadId: 'trusted-thread',
+      mastra__user: { id: 'trusted-user' },
+      mastra__userPermissions: ['agents:execute'],
+      mastra__userRoles: ['trusted-role'],
+      mastra__authToken: 'trusted-token',
+      mastra__isStudio: false,
+      mastra__authMode: 'server',
+      mastra__inheritedMemory: { trusted: true },
+      organizationId: 'trusted-organization',
+      'server-owned-key': 'trusted-server-value',
+    } as const;
+
+    const bodyRequestContext = {
+      customNetworkKey: 'from-body',
+      mastra__resourceId: 'body-resource',
+      mastra__threadId: 'body-thread',
+      mastra__user: { id: 'body-user' },
+      mastra__userPermissions: ['admin'],
+      mastra__userRoles: ['body-role'],
+      mastra__authToken: 'body-token',
+      mastra__isStudio: true,
+      mastra__authMode: 'studio',
+      mastra__inheritedMemory: { hostile: true },
+      organizationId: 'body-organization',
+      'server-owned-key': 'body-attempted-value',
+    };
+
+    it.each([
+      {
+        name: 'network start',
+        path: '/api/agents/network-agent/network',
+        body: {
+          messages: [{ role: 'user', content: 'start network' }],
+          model: 'openai/gpt-4o-mini',
+        },
+        invoke: (agent: Agent) => vi.spyOn(agent, 'network'),
+      },
+      {
+        name: 'network approval',
+        path: '/api/agents/network-agent/approve-network-tool-call',
+        body: { runId: 'network-run', model: 'openai/gpt-4o-mini' },
+        invoke: (agent: Agent) => vi.spyOn(agent, 'resumeNetwork'),
+      },
+      {
+        name: 'network decline',
+        path: '/api/agents/network-agent/decline-network-tool-call',
+        body: { runId: 'network-run', model: 'openai/gpt-4o-mini', reason: 'not allowed' },
+        invoke: (agent: Agent) => vi.spyOn(agent, 'resumeNetwork'),
+      },
+    ] as const)('$name receives adapter-merged trusted request context over HTTP', async ({ path, body, invoke }) => {
+      const agent = new Agent({
+        id: 'network-agent',
+        name: 'network-agent',
+        instructions: 'test',
+        model: 'openai/gpt-4o-mini',
+      });
+      const expectedStream = new ReadableStream({ start: controller => controller.close() });
+      const execution = invoke(agent).mockResolvedValue(expectedStream as any);
+      const mastra = new Mastra({
+        logger: false,
+        agents: { 'network-agent': agent },
+        server: {
+          middleware: async (c, next) => {
+            const requestContext = c.get('requestContext');
+            for (const [key, value] of Object.entries(trustedContext)) {
+              requestContext.set(key, value);
+            }
+            await next();
+          },
+        },
+      });
+      const app = new Hono();
+      await new MastraServer({ app, mastra }).init();
+
+      const response = await app.request(
+        new Request(`http://localhost${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...body, requestContext: bodyRequestContext }),
+        }),
+      );
+      await response.text();
+
+      expect(response.status).toBe(200);
+      expect(execution).toHaveBeenCalledTimes(1);
+      const call = execution.mock.calls[0]!;
+      const options = call[1] as { requestContext: any; abortSignal?: AbortSignal };
+      const requestContext = options.requestContext;
+
+      expect(requestContext.get('customNetworkKey')).toBe('from-body');
+      for (const [key, value] of Object.entries(trustedContext)) {
+        expect(requestContext.get(key)).toEqual(value);
+      }
+      expect(requestContext.get('mastra__resourceId')).not.toBe('body-resource');
+      expect(requestContext.get('organizationId')).not.toBe('body-organization');
+      expect(requestContext.get('server-owned-key')).not.toBe('body-attempted-value');
+      expect(options.abortSignal).toBeInstanceOf(AbortSignal);
+
+      if (path.includes('/approve-')) {
+        expect(call[0]).toEqual({ approved: true });
+      }
+      if (path.includes('/decline-')) {
+        expect(call[0]).toEqual({ approved: false, reason: 'not allowed' });
       }
     });
   });

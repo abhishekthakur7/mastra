@@ -32,9 +32,14 @@ import {
   GET_AGENT_BY_ID_ROUTE,
   LIST_AGENTS_ROUTE,
   STREAM_GENERATE_ROUTE,
+  STREAM_UNTIL_IDLE_GENERATE_ROUTE,
+  STREAM_NETWORK_ROUTE,
   RESUME_STREAM_ROUTE,
+  RESUME_STREAM_UNTIL_IDLE_ROUTE,
   APPROVE_TOOL_CALL_ROUTE,
   DECLINE_TOOL_CALL_ROUTE,
+  APPROVE_NETWORK_TOOL_CALL_ROUTE,
+  DECLINE_NETWORK_TOOL_CALL_ROUTE,
   APPROVE_TOOL_CALL_GENERATE_ROUTE,
   DECLINE_TOOL_CALL_GENERATE_ROUTE,
   RECOVER_ROUTE,
@@ -1186,6 +1191,290 @@ describe('Agent Routes Authorization', () => {
           status: 400,
         }),
       );
+    });
+  });
+
+  describe('network routes', () => {
+    function createNetworkRequestContext(bodyRequestContext: Record<string, unknown>) {
+      const requestContext = createContextWithReservedKeys({
+        resourceId: 'trusted-resource',
+        threadId: 'trusted-thread',
+      });
+
+      // These values represent server-owned context populated before the body
+      // request context is merged by the server adapter.
+      requestContext.set('organizationId', 'trusted-organization');
+      requestContext.set('server-owned-key', 'trusted-server-value');
+
+      // Route handlers receive the adapter's merged RequestContext. Mirror the
+      // adapter merge here so the route contract tests can assert that custom
+      // body values are accepted while reserved and existing values remain
+      // server-controlled.
+      for (const [key, value] of Object.entries(bodyRequestContext)) {
+        if (
+          key === MASTRA_RESOURCE_ID_KEY ||
+          key === MASTRA_THREAD_ID_KEY ||
+          key === 'organizationId' ||
+          requestContext.get(key) !== undefined
+        ) {
+          continue;
+        }
+        requestContext.set(key, value);
+      }
+
+      return requestContext;
+    }
+
+    it('STREAM_NETWORK_ROUTE forwards model, trusted context, and abort signal', async () => {
+      const bodyRequestContext = {
+        'network-custom-key': 'from-body',
+        [MASTRA_RESOURCE_ID_KEY]: 'body-resource',
+        [MASTRA_THREAD_ID_KEY]: 'body-thread',
+        organizationId: 'body-organization',
+        'server-owned-key': 'body-attempted-value',
+      };
+      const requestContext = createNetworkRequestContext(bodyRequestContext);
+      const abortController = new AbortController();
+      const expectedStream = new ReadableStream();
+      const network = vi.spyOn(mockAgent, 'network').mockResolvedValue(expectedStream as any);
+
+      const result = await STREAM_NETWORK_ROUTE.handler({
+        mastra,
+        agentId: 'test-agent',
+        requestContext,
+        abortSignal: abortController.signal,
+        messages: [{ role: 'user', content: 'network request' }],
+        runId: 'network-run',
+        model: 'openai/gpt-5-mini',
+      } as any);
+
+      expect(network).toHaveBeenCalledWith(
+        [{ role: 'user', content: 'network request' }],
+        expect.objectContaining({
+          runId: 'network-run',
+          model: 'openai/gpt-5-mini',
+          requestContext,
+          abortSignal: abortController.signal,
+        }),
+      );
+      expect(requestContext.get('network-custom-key')).toBe('from-body');
+      expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBe('trusted-resource');
+      expect(requestContext.get(MASTRA_THREAD_ID_KEY)).toBe('trusted-thread');
+      expect(requestContext.get('organizationId')).toBe('trusted-organization');
+      expect(requestContext.get('server-owned-key')).toBe('trusted-server-value');
+      expect(result).toBe(expectedStream);
+    });
+
+    it('should reject network memory access when the thread belongs to a different resource', async () => {
+      await mockMemory.createThread({
+        threadId: 'network-thread-owned-by-b',
+        resourceId: 'user-b',
+        title: 'Thread B',
+      });
+      const requestContext = createContextWithReservedKeys({ resourceId: 'user-a' });
+      const network = vi.spyOn(mockAgent, 'network');
+
+      await expect(
+        STREAM_NETWORK_ROUTE.handler({
+          mastra,
+          agentId: 'test-agent',
+          requestContext,
+          abortSignal: new AbortController().signal,
+          messages: [{ role: 'user', content: 'network request' }],
+          memory: {
+            thread: 'network-thread-owned-by-b',
+            resource: 'user-a',
+          },
+        } as any),
+      ).rejects.toThrow(new HTTPException(403, { message: 'Access denied: thread belongs to a different resource' }));
+
+      expect(network).not.toHaveBeenCalled();
+    });
+
+    it('allows network memory access for the same resource and normalizes memory options', async () => {
+      await mockMemory.createThread({
+        threadId: 'network-thread-owned-by-a',
+        resourceId: 'user-a',
+        title: 'Thread A',
+      });
+      const requestContext = createContextWithReservedKeys({ resourceId: 'user-a' });
+      const abortController = new AbortController();
+      const expectedStream = new ReadableStream();
+      let capturedMemoryOption: any;
+      let capturedOptions: any;
+      const network = vi.spyOn(mockAgent, 'network').mockImplementation(async (_messages, options) => {
+        capturedMemoryOption = options?.memory;
+        capturedOptions = options;
+        return expectedStream as any;
+      });
+
+      const result = await STREAM_NETWORK_ROUTE.handler({
+        mastra,
+        agentId: 'test-agent',
+        requestContext,
+        abortSignal: abortController.signal,
+        messages: [{ role: 'user', content: 'network request' }],
+        memory: {
+          thread: 'network-thread-owned-by-a',
+          resource: 'user-b',
+        },
+      } as any);
+
+      expect(network).toHaveBeenCalledTimes(1);
+      expect(capturedMemoryOption).toEqual(
+        expect.objectContaining({
+          thread: 'network-thread-owned-by-a',
+          resource: 'user-a',
+        }),
+      );
+      expect(capturedOptions.requestContext).toBe(requestContext);
+      expect(capturedOptions.abortSignal).toBe(abortController.signal);
+      expect(result).toBe(expectedStream);
+    });
+
+    it.each([
+      {
+        name: 'approve',
+        route: APPROVE_NETWORK_TOOL_CALL_ROUTE,
+        expectedResumeData: { approved: true },
+        body: { model: 'openai/gpt-5-mini' },
+      },
+      {
+        name: 'decline with reason',
+        route: DECLINE_NETWORK_TOOL_CALL_ROUTE,
+        expectedResumeData: { approved: false, reason: 'not allowed' },
+        body: { model: 'openai/gpt-5-mini', reason: 'not allowed' },
+      },
+      {
+        name: 'decline without reason',
+        route: DECLINE_NETWORK_TOOL_CALL_ROUTE,
+        expectedResumeData: { approved: false },
+        body: { model: 'openai/gpt-5-mini' },
+      },
+    ] as const)(
+      '$name network continuation forwards resume data, model, context, and abort signal',
+      async ({ route, expectedResumeData, body }) => {
+        const bodyRequestContext = {
+          'network-custom-key': 'from-body',
+          [MASTRA_RESOURCE_ID_KEY]: 'body-resource',
+          [MASTRA_THREAD_ID_KEY]: 'body-thread',
+          organizationId: 'body-organization',
+          'server-owned-key': 'body-attempted-value',
+        };
+        const requestContext = createNetworkRequestContext(bodyRequestContext);
+        const abortController = new AbortController();
+        const expectedStream = new ReadableStream();
+        let capturedResumeData: unknown;
+        let capturedOptions: unknown;
+        const resumeNetwork = vi.spyOn(mockAgent, 'resumeNetwork').mockImplementation(async (resumeData, options) => {
+          capturedResumeData = resumeData;
+          capturedOptions = options;
+          return expectedStream as any;
+        });
+
+        const result = await route.handler({
+          mastra,
+          agentId: 'test-agent',
+          requestContext,
+          abortSignal: abortController.signal,
+          runId: 'network-continuation-run',
+          ...body,
+        } as any);
+
+        expect(resumeNetwork).toHaveBeenCalledTimes(1);
+        expect(capturedResumeData).toEqual(expectedResumeData);
+        expect(capturedOptions).toEqual(
+          expect.objectContaining({
+            runId: 'network-continuation-run',
+            model: 'openai/gpt-5-mini',
+            requestContext,
+            abortSignal: abortController.signal,
+          }),
+        );
+        expect(requestContext.get('network-custom-key')).toBe('from-body');
+        expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBe('trusted-resource');
+        expect(requestContext.get(MASTRA_THREAD_ID_KEY)).toBe('trusted-thread');
+        expect(requestContext.get('organizationId')).toBe('trusted-organization');
+        expect(requestContext.get('server-owned-key')).toBe('trusted-server-value');
+        expect(result).toBe(expectedStream);
+      },
+    );
+
+    it.each([STREAM_NETWORK_ROUTE, APPROVE_NETWORK_TOOL_CALL_ROUTE, DECLINE_NETWORK_TOOL_CALL_ROUTE])(
+      'requires agents:execute permission for %s',
+      route => {
+        expect(route.requiresPermission).toBe('agents:execute');
+      },
+    );
+  });
+
+  describe('idle-loop stream routes', () => {
+    it('STREAM_UNTIL_IDLE_GENERATE_ROUTE should call streamUntilIdle with request context and abort signal', async () => {
+      const requestContext = createContextWithReservedKeys({});
+      requestContext.set('custom-key', 'stream-until-idle-value');
+      const abortController = new AbortController();
+      const expectedStream = new ReadableStream();
+      const messages = [{ role: 'user', content: 'stream until idle' }];
+      let capturedMessages: unknown;
+      let capturedOptions: any;
+
+      const streamUntilIdle = vi.spyOn(mockAgent, 'streamUntilIdle').mockImplementation(async (input, options) => {
+        capturedMessages = input;
+        capturedOptions = options;
+        return { fullStream: expectedStream } as any;
+      });
+
+      const result = await STREAM_UNTIL_IDLE_GENERATE_ROUTE.handler({
+        mastra,
+        agentId: 'test-agent',
+        requestContext,
+        abortSignal: abortController.signal,
+        messages,
+      } as any);
+
+      expect(streamUntilIdle).toHaveBeenCalledTimes(1);
+      expect(capturedMessages).toEqual(messages);
+      expect(capturedOptions.requestContext).toBe(requestContext);
+      expect(capturedOptions.requestContext.get('custom-key')).toBe('stream-until-idle-value');
+      expect(capturedOptions.abortSignal).toBe(abortController.signal);
+      expect(result).toBe(expectedStream);
+    });
+
+    it('RESUME_STREAM_UNTIL_IDLE_ROUTE should call resumeStreamUntilIdle with resume data and request context', async () => {
+      const requestContext = createContextWithReservedKeys({});
+      requestContext.set('custom-key', 'resume-until-idle-value');
+      const abortController = new AbortController();
+      const expectedStream = new ReadableStream();
+      const resumeData = { approved: true, answer: 'continue' };
+      let capturedResumeData: unknown;
+      let capturedOptions: any;
+
+      const resumeStreamUntilIdle = vi
+        .spyOn(mockAgent, 'resumeStreamUntilIdle')
+        .mockImplementation(async (input, options) => {
+          capturedResumeData = input;
+          capturedOptions = options;
+          return { fullStream: expectedStream } as any;
+        });
+
+      const result = await RESUME_STREAM_UNTIL_IDLE_ROUTE.handler({
+        mastra,
+        agentId: 'test-agent',
+        requestContext,
+        abortSignal: abortController.signal,
+        runId: 'idle-resume-run',
+        toolCallId: 'idle-resume-tool-call',
+        resumeData,
+      } as any);
+
+      expect(resumeStreamUntilIdle).toHaveBeenCalledTimes(1);
+      expect(capturedResumeData).toEqual(resumeData);
+      expect(capturedOptions.runId).toBe('idle-resume-run');
+      expect(capturedOptions.toolCallId).toBe('idle-resume-tool-call');
+      expect(capturedOptions.requestContext).toBe(requestContext);
+      expect(capturedOptions.requestContext.get('custom-key')).toBe('resume-until-idle-value');
+      expect(capturedOptions.abortSignal).toBe(abortController.signal);
+      expect(result).toBe(expectedStream);
     });
   });
 

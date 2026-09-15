@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { RequestContext } from '../../request-context';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
 import { runAgentEntry } from './run-agent-entry';
 import type { EntryExecuteContext } from './types';
@@ -224,5 +225,74 @@ describe('runAgentEntry structured output guard', () => {
     const result = await runAgentEntry({ type: 'agent', id: 'step-1', agentId: 'v2-agent', agent }, makeDefaultCtx());
 
     expect(result).toEqual({ text: '' });
+  });
+
+  it('forwards vNext run context and step options and returns the structured result', async () => {
+    const requestContext = new RequestContext();
+    requestContext.set('tenantId', 'tenant-vnext');
+    const abortController = new AbortController();
+    const actor = { actorKind: 'system', propagate: true };
+    const writer = { write: vi.fn(async () => {}) };
+    const schema = { parse: (value: unknown) => value };
+    const finish = {
+      text: 'ignored text because structured output is present',
+      object: { answer: 'structured answer' },
+      finishReason: 'stop',
+    };
+    const getModel = vi.fn(async ({ requestContext: received }: { requestContext: RequestContext }) => {
+      expect(received).toBe(requestContext);
+      return { specificationVersion: 'v2' };
+    });
+    const stream = vi.fn(async (_prompt: string, options: Record<string, unknown>) => ({
+      text: Promise.resolve(finish.text),
+      fullStream: (async function* () {
+        yield { type: 'text-delta', textDelta: 'structured answer' };
+        (options.onFinish as ((result: typeof finish) => void) | undefined)?.(finish);
+      })(),
+    }));
+    const agent = {
+      name: 'vnext-agent',
+      getModel,
+      stream,
+    };
+
+    const result = await runAgentEntry(
+      {
+        type: 'agent',
+        id: 'step-1',
+        agentId: 'vnext-agent',
+        agent,
+        options: {
+          actor,
+          instructions: 'step-specific instructions',
+          maxSteps: 3,
+          modelSettings: { temperature: 0.2 },
+          structuredOutput: { schema },
+        },
+      },
+      {
+        ...makeDefaultCtx(),
+        requestContext,
+        actor,
+        abortSignal: abortController.signal,
+        writer,
+      } as EntryExecuteContext,
+    );
+
+    expect(getModel).toHaveBeenCalledWith({ requestContext });
+    expect(stream).toHaveBeenCalledWith(
+      'hi',
+      expect.objectContaining({
+        requestContext,
+        actor,
+        abortSignal: abortController.signal,
+        instructions: 'step-specific instructions',
+        maxSteps: 3,
+        modelSettings: { temperature: 0.2 },
+        structuredOutput: { schema },
+      }),
+    );
+    expect(result).toEqual(finish.object);
+    expect(writer.write).toHaveBeenCalledWith({ type: 'text-delta', textDelta: 'structured answer' });
   });
 });

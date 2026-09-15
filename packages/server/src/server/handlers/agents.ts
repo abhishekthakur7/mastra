@@ -3237,31 +3237,68 @@ export const STREAM_NETWORK_ROUTE = createRoute({
   description: 'Executes an agent network with multiple agents and streams the response',
   tags: ['Agents'],
   requiresAuth: true,
-  handler: async ({ mastra, messages, agentId, requestContext, ...params }) => {
+  requiresPermission: MastraFGAPermissions.AGENTS_EXECUTE,
+  handler: async ({ mastra, messages, agentId, abortSignal, requestContext: serverRequestContext, ...params }) => {
     try {
-      const agent = await getAgentFromSystem({
-        mastra,
-        agentId,
-        versionOptions: extractVersionOptions(requestContext),
-      });
-
       // UI Frameworks may send "client tools" in the body,
       // but it interferes with llm providers tool handling, so we remove them
       sanitizeBody(params, ['tools', 'actor']);
 
+      const { versions, ...rest } = params;
       validateBody({ messages });
 
+      const versionOptions = extractVersionOptions(serverRequestContext);
+
+      const agent = await getAgentFromSystem({
+        mastra,
+        agentId,
+        versionOptions,
+        requestContext: serverRequestContext,
+      });
+
+      stashVersionOverrides(serverRequestContext, versions);
+      ensureDefaultVersionStatus(serverRequestContext, versionOptions);
+
       // Authorization: context values take precedence over client-provided values
-      let authorizedMemoryOption = params.memory;
-      if (params.memory) {
-        const effectiveResourceId = getEffectiveResourceId(requestContext, params.memory.resource);
+      let authorizedMemoryOption = rest.memory;
+      if (rest.memory) {
+        const clientThreadId = typeof rest.memory.thread === 'string' ? rest.memory.thread : rest.memory.thread?.id;
+
+        const effectiveResourceId = getEffectiveResourceId(serverRequestContext, rest.memory.resource);
         requireEffectiveResourceId(effectiveResourceId);
-        authorizedMemoryOption = { ...params.memory, resource: effectiveResourceId };
+        const effectiveThreadId = getEffectiveThreadId(serverRequestContext, clientThreadId);
+
+        // Validate thread ownership if accessing an existing thread
+        if (effectiveThreadId) {
+          const memoryInstance = await agent.getMemory({ requestContext: serverRequestContext });
+          if (memoryInstance) {
+            const thread = await memoryInstance.getThreadById({ threadId: effectiveThreadId });
+            if (thread) {
+              await enforceThreadAccess({
+                mastra,
+                requestContext: serverRequestContext,
+                threadId: effectiveThreadId,
+                thread,
+                effectiveResourceId,
+                permission: MastraFGAPermissions.MEMORY_WRITE,
+              });
+            }
+          }
+        }
+
+        // Build authorized memory option with effective values
+        authorizedMemoryOption = {
+          ...rest.memory,
+          resource: effectiveResourceId ?? rest.memory.resource,
+          thread: effectiveThreadId ?? rest.memory.thread,
+        };
       }
 
       const streamResult = await agent.network(messages, {
-        ...params,
+        ...rest,
         memory: authorizedMemoryOption,
+        requestContext: serverRequestContext,
+        abortSignal,
       });
 
       return streamResult;
@@ -3283,25 +3320,35 @@ export const APPROVE_NETWORK_TOOL_CALL_ROUTE = createRoute({
   description: 'Approves a pending network tool call and continues network agent execution',
   tags: ['Agents', 'Tools'],
   requiresAuth: true,
-  handler: async ({ mastra, agentId, requestContext, ...params }) => {
+  requiresPermission: MastraFGAPermissions.AGENTS_EXECUTE,
+  handler: async ({ mastra, agentId, abortSignal, requestContext: serverRequestContext, ...params }) => {
     try {
+      const rest = params;
+      const versionOptions = extractVersionOptions(serverRequestContext);
+
       const agent = await getAgentFromSystem({
         mastra,
         agentId,
-        versionOptions: extractVersionOptions(requestContext),
+        versionOptions,
+        requestContext: serverRequestContext,
       });
 
-      if (!params.runId) {
+      if (!rest.runId) {
         throw new HTTPException(400, { message: 'Run id is required' });
       }
 
       // UI Frameworks may send "client tools" in the body,
       // but it interferes with llm providers tool handling, so we remove them
-      sanitizeBody(params, ['tools', 'actor']);
+      sanitizeBody(rest, ['tools', 'actor']);
 
-      const streamResult = await agent.approveNetworkToolCall({
-        ...params,
-      });
+      const streamResult = await agent.resumeNetwork(
+        { approved: true },
+        {
+          ...rest,
+          requestContext: serverRequestContext,
+          abortSignal,
+        },
+      );
 
       return streamResult;
     } catch (error) {
@@ -3322,25 +3369,35 @@ export const DECLINE_NETWORK_TOOL_CALL_ROUTE = createRoute({
   description: 'Declines a pending network tool call and continues network agent execution without executing the tool',
   tags: ['Agents', 'Tools'],
   requiresAuth: true,
-  handler: async ({ mastra, agentId, requestContext, ...params }) => {
+  requiresPermission: MastraFGAPermissions.AGENTS_EXECUTE,
+  handler: async ({ mastra, agentId, abortSignal, requestContext: serverRequestContext, ...params }) => {
     try {
+      const { reason, ...rest } = params;
+      const versionOptions = extractVersionOptions(serverRequestContext);
+
       const agent = await getAgentFromSystem({
         mastra,
         agentId,
-        versionOptions: extractVersionOptions(requestContext),
+        versionOptions,
+        requestContext: serverRequestContext,
       });
 
-      if (!params.runId) {
+      if (!rest.runId) {
         throw new HTTPException(400, { message: 'Run id is required' });
       }
 
       // UI Frameworks may send "client tools" in the body,
       // but it interferes with llm providers tool handling, so we remove them
-      sanitizeBody(params, ['tools', 'actor']);
+      sanitizeBody(rest, ['tools', 'actor']);
 
-      const streamResult = await agent.declineNetworkToolCall({
-        ...params,
-      });
+      const streamResult = await agent.resumeNetwork(
+        { approved: false, ...(reason !== undefined ? { reason } : {}) },
+        {
+          ...rest,
+          requestContext: serverRequestContext,
+          abortSignal,
+        },
+      );
 
       return streamResult;
     } catch (error) {

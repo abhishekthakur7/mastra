@@ -25,6 +25,8 @@
     "build:lib": "tsdown --silent --config tsdown.config.ts",
     "prepack": "tsx ../../scripts/generate-package-docs.ts",
     "build:watch": "pnpm build:lib --watch",
+    "test:subscription-runtime": "vitest run ./src/__fixtures__/subscription-runtime/harness.test.ts ./src/__fixtures__/subscription-runtime/claude-launch-profile.test.ts ./src/__fixtures__/subscription-runtime/claude-probe.test.ts ./src/__fixtures__/subscription-runtime/claude-protocol.test.ts ./src/__fixtures__/subscription-runtime/claude-live-wire.test.ts ./src/__fixtures__/subscription-runtime/claude-live-probe.test.ts ./src/__fixtures__/subscription-runtime/claude-live-recovery.test.ts ./src/__fixtures__/subscription-runtime/claude-tool-bridge.test.ts",
+    "typecheck:subscription-runtime": "tsc --noEmit -p ./tsconfig.subscription-runtime.fixture.json",
     "test:client": "vitest run ./src/client/client.test.ts ./src/client/configuration.test.ts ./src/client/error-utils.test.ts ./src/client/oauth.test.ts ./src/client/oauth-callback-server.test.ts ./src/client/oauth-flow.test.ts ./src/client/url-policy.test.ts ./src/client/stdio-env.test.ts",
     "test:server": "vitest run ./src/server",
     "test:integration": "cd integration-tests && pnpm test:mcp",
